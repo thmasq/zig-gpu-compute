@@ -13,15 +13,12 @@ var shared_mem: [512]f32 addrspace(.shared) = undefined;
 
 // Kernel attributes for AMD GPU
 export fn vector_add_shared(a: [*]addrspace(.global) const f32, b: [*]addrspace(.global) const f32, c: [*]addrspace(.global) f32, n: u32) callconv(.Kernel) void {
-    // Get work item and group IDs using external intrinsics
-    const gid = @"llvm.amdgcn.workitem.id.x"();
-    const lid = @"llvm.amdgcn.workgroup.id.x"();
+    // Correct ID usage
+    const local_id = @"llvm.amdgcn.workitem.id.x"(); // 0-255 within workgroup
+    const group_id = @"llvm.amdgcn.workgroup.id.x"(); // Workgroup index
 
-    // For workgroup size, we'll use a constant since it's set at dispatch
-    const lsize: u32 = 256; // This should match the workgroup size in dispatch
-
-    const global_id = lid * lsize + gid;
-    const local_id = gid;
+    const lsize: u32 = 256; // Workgroup size
+    const global_id = group_id * lsize + local_id;
 
     if (global_id >= n) return;
 
@@ -34,25 +31,24 @@ export fn vector_add_shared(a: [*]addrspace(.global) const f32, b: [*]addrspace(
     // Perform reduction in shared memory
     var stride: u32 = lsize / 2;
     while (stride > 0) : (stride /= 2) {
-        if (local_id < stride) {
+        if (local_id < stride and local_id + stride < lsize) {
             shared_mem[local_id] += shared_mem[local_id + stride];
         }
         @"llvm.amdgcn.s.barrier"();
     }
 
-    // Write result
+    // Only thread 0 writes the reduced result for this workgroup
     if (local_id == 0) {
-        c[lid] = shared_mem[0];
-    } else if (global_id < n) {
-        c[global_id] = shared_mem[local_id];
+        c[group_id] = shared_mem[0]; // One result per workgroup
     }
 }
 
 export fn matrix_multiply_shared(a: [*]addrspace(.global) const f32, b: [*]addrspace(.global) const f32, c: [*]addrspace(.global) f32, width: u32) callconv(.Kernel) void {
-    const tx = @"llvm.amdgcn.workitem.id.x"();
-    const ty = @"llvm.amdgcn.workitem.id.y"();
-    const bx = @"llvm.amdgcn.workgroup.id.x"();
-    const by = @"llvm.amdgcn.workgroup.id.y"();
+    // Correct ID usage
+    const local_x = @"llvm.amdgcn.workitem.id.x"(); // Local thread ID in X
+    const local_y = @"llvm.amdgcn.workitem.id.y"(); // Local thread ID in Y
+    const group_x = @"llvm.amdgcn.workgroup.id.x"(); // Workgroup ID in X
+    const group_y = @"llvm.amdgcn.workgroup.id.y"(); // Workgroup ID in Y
 
     const TILE_SIZE = 16;
 
@@ -60,8 +56,8 @@ export fn matrix_multiply_shared(a: [*]addrspace(.global) const f32, b: [*]addrs
     const as_tile = @as(*[TILE_SIZE][TILE_SIZE]f32, @ptrFromInt(@intFromPtr(&shared_mem[0])));
     const bs_tile = @as(*[TILE_SIZE][TILE_SIZE]f32, @ptrFromInt(@intFromPtr(&shared_mem[256])));
 
-    const row = by * TILE_SIZE + ty;
-    const col = bx * TILE_SIZE + tx;
+    const row = group_y * TILE_SIZE + local_y;
+    const col = group_x * TILE_SIZE + local_x;
 
     var c_val: f32 = 0.0;
 
@@ -69,19 +65,19 @@ export fn matrix_multiply_shared(a: [*]addrspace(.global) const f32, b: [*]addrs
     var tile: u32 = 0;
     while (tile < (width + TILE_SIZE - 1) / TILE_SIZE) : (tile += 1) {
         // Load tiles into shared memory
-        const a_col = tile * TILE_SIZE + tx;
-        const b_row = tile * TILE_SIZE + ty;
+        const a_col = tile * TILE_SIZE + local_x;
+        const b_row = tile * TILE_SIZE + local_y;
 
         if (row < width and a_col < width) {
-            as_tile[ty][tx] = a[row * width + a_col];
+            as_tile[local_y][local_x] = a[row * width + a_col];
         } else {
-            as_tile[ty][tx] = 0.0;
+            as_tile[local_y][local_x] = 0.0;
         }
 
         if (b_row < width and col < width) {
-            bs_tile[ty][tx] = b[b_row * width + col];
+            bs_tile[local_y][local_x] = b[b_row * width + col];
         } else {
-            bs_tile[ty][tx] = 0.0;
+            bs_tile[local_y][local_x] = 0.0;
         }
 
         @"llvm.amdgcn.s.barrier"();
@@ -89,7 +85,7 @@ export fn matrix_multiply_shared(a: [*]addrspace(.global) const f32, b: [*]addrs
         // Compute partial result
         var k: u32 = 0;
         while (k < TILE_SIZE) : (k += 1) {
-            c_val += as_tile[ty][k] * bs_tile[k][tx];
+            c_val += as_tile[local_y][k] * bs_tile[k][local_x];
         }
 
         @"llvm.amdgcn.s.barrier"();

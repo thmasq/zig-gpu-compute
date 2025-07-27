@@ -438,7 +438,7 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
 
     const a = try ctx.allocateMemory(n * @sizeOf(f32), f32);
     const b = try ctx.allocateMemory(n * @sizeOf(f32), f32);
-    const result_c = try ctx.allocateMemory(num_groups * @sizeOf(f32), f32);
+    const result_c = try ctx.allocateMemory(n * @sizeOf(f32), f32);
     defer ctx.freeMemory(a);
     defer ctx.freeMemory(b);
     defer ctx.freeMemory(result_c);
@@ -448,14 +448,14 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
         b[i] = @floatFromInt(i * 2);
     }
 
-    const kernargs = try ctx.allocateKernargs(4 * 8);
-    defer ctx.freeMemory(kernargs);
-
+    const kernargs = try ctx.allocateKernargs(32);
     const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs);
     arg_ptrs[0] = @intFromPtr(a.ptr);
     arg_ptrs[1] = @intFromPtr(b.ptr);
     arg_ptrs[2] = @intFromPtr(result_c.ptr);
-    arg_ptrs[3] = n;
+    // Write the u32 value properly
+    const n_ptr = @as(*u32, @ptrCast(@alignCast(&kernargs[24])));
+    n_ptr.* = n;
 
     const symbol = try kernel_manager.getKernelSymbol("vector_add_shared");
     try executeKernel(ctx, symbol, kernargs, .{ num_groups * workgroup_size, 1, 1 }, .{ workgroup_size, 1, 1 });
