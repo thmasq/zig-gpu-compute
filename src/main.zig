@@ -22,9 +22,9 @@ const HsaError = error{
 const GpuContext = struct {
     agent: c.hsa_agent_t,
     queue: ?*c.hsa_queue_t,
-    kernarg_region: ?c.hsa_region_t, // Changed to optional
-    fine_grained_region: ?c.hsa_region_t, // Changed to optional
-    coarse_grained_region: ?c.hsa_region_t, // Changed to optional
+    kernarg_region: ?c.hsa_region_t,
+    fine_grained_region: ?c.hsa_region_t,
+    coarse_grained_region: ?c.hsa_region_t,
 
     const Self = @This();
 
@@ -41,9 +41,9 @@ const GpuContext = struct {
         var ctx = Self{
             .agent = undefined,
             .queue = null,
-            .kernarg_region = null, // Initialize as null
-            .fine_grained_region = null, // Initialize as null
-            .coarse_grained_region = null, // Initialize as null
+            .kernarg_region = null,
+            .fine_grained_region = null,
+            .coarse_grained_region = null,
         };
 
         print("Searching for GPU agents...\n", .{});
@@ -70,7 +70,6 @@ const GpuContext = struct {
         print("  Fine-grained region: {}\n", .{ctx.fine_grained_region != null});
         print("  Coarse-grained region: {}\n", .{ctx.coarse_grained_region != null});
 
-        // For modern GPUs, kernarg region is optional - we can use fine-grained instead
         if (ctx.kernarg_region == null) {
             print("Note: No dedicated kernarg region found, will use fine-grained global memory\n", .{});
         }
@@ -121,7 +120,6 @@ const GpuContext = struct {
     }
 
     fn allocateKernargs(self: *Self, size: usize) ![]u8 {
-        // Use fine-grained region for kernel arguments (standard for modern GPUs)
         const region = if (self.kernarg_region) |kr| kr else self.fine_grained_region.?;
 
         print("Allocating {} bytes for kernel arguments using {s} region\n", .{ size, if (self.kernarg_region != null) "kernarg" else "fine-grained" });
@@ -143,12 +141,12 @@ const GpuContext = struct {
     }
 };
 
-// Rest of KernelManager code remains the same...
 const KernelManager = struct {
     code_object_reader: c.hsa_code_object_reader_t,
     executable: c.hsa_executable_t,
     code_data: []u8,
     allocator: std.mem.Allocator,
+    agent: c.hsa_agent_t, // Add agent reference
 
     const Self = @This();
 
@@ -173,7 +171,6 @@ const KernelManager = struct {
         _ = try file.readAll(code_data);
         print("Successfully read {} bytes from kernel file\n", .{code_data.len});
 
-        // Check file header to see if it looks like a valid object file
         if (code_data.len >= 4) {
             print("File header: 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} 0x{X:0>2}\n", .{ code_data[0], code_data[1], code_data[2], code_data[3] });
         }
@@ -183,6 +180,7 @@ const KernelManager = struct {
             .executable = undefined,
             .code_data = code_data,
             .allocator = allocator,
+            .agent = ctx.agent, // Store agent reference
         };
 
         // Create code object reader from memory
@@ -241,7 +239,8 @@ const KernelManager = struct {
 
         print("Looking for kernel symbol: {s} (length: {})\n", .{ full_name, full_name.len });
 
-        var status = c.hsa_executable_get_symbol_by_name(self.executable, full_name.ptr, null, &symbol);
+        // FIX: Pass the agent reference instead of null
+        var status = c.hsa_executable_get_symbol_by_name(self.executable, full_name.ptr, &self.agent, &symbol);
         if (status != c.HSA_STATUS_SUCCESS) {
             print("Symbol lookup with .kd failed: {} (0x{X})\n", .{ status, status });
 
@@ -251,7 +250,7 @@ const KernelManager = struct {
             };
             print("Trying base name: {s}\n", .{base_name});
 
-            status = c.hsa_executable_get_symbol_by_name(self.executable, base_name.ptr, null, &symbol);
+            status = c.hsa_executable_get_symbol_by_name(self.executable, base_name.ptr, &self.agent, &symbol);
             if (status != c.HSA_STATUS_SUCCESS) {
                 print("Base name lookup also failed: {} (0x{X})\n", .{ status, status });
 
@@ -282,10 +281,9 @@ fn listSymbolsCallback(executable: c.hsa_executable_t, symbol: c.hsa_executable_
     var symbol_type: c.hsa_symbol_kind_t = undefined;
     var status = c.hsa_executable_symbol_get_info(symbol, c.HSA_EXECUTABLE_SYMBOL_INFO_TYPE, &symbol_type);
     if (status != c.HSA_STATUS_SUCCESS) {
-        return c.HSA_STATUS_SUCCESS; // Continue iteration
+        return c.HSA_STATUS_SUCCESS;
     }
 
-    // Only show kernel symbols
     if (symbol_type == c.HSA_SYMBOL_KIND_KERNEL) {
         var name_length: u32 = 0;
         status = c.hsa_executable_symbol_get_info(symbol, c.HSA_EXECUTABLE_SYMBOL_INFO_NAME_LENGTH, &name_length);
@@ -306,7 +304,6 @@ fn listSymbolsCallback(executable: c.hsa_executable_t, symbol: c.hsa_executable_
     return c.HSA_STATUS_SUCCESS;
 }
 
-// Updated findMemoryRegions with debug output
 fn findMemoryRegions(region: c.hsa_region_t, data: ?*anyopaque) callconv(.C) c.hsa_status_t {
     const ctx: *GpuContext = @ptrCast(@alignCast(data));
 
@@ -342,7 +339,6 @@ fn findMemoryRegions(region: c.hsa_region_t, data: ?*anyopaque) callconv(.C) c.h
     return c.HSA_STATUS_SUCCESS;
 }
 
-// Rest of the helper functions and main remain the same...
 fn findGpuAgent(agent: c.hsa_agent_t, data: ?*anyopaque) callconv(.C) c.hsa_status_t {
     var device_type: c.hsa_device_type_t = undefined;
     const status = c.hsa_agent_get_info(agent, c.HSA_AGENT_INFO_DEVICE, &device_type);
@@ -351,7 +347,6 @@ fn findGpuAgent(agent: c.hsa_agent_t, data: ?*anyopaque) callconv(.C) c.hsa_stat
         return status;
     }
 
-    // Debug: Print all agents found
     var name: [64]u8 = undefined;
     const name_status = c.hsa_agent_get_info(agent, c.HSA_AGENT_INFO_NAME, &name);
     if (name_status == c.HSA_STATUS_SUCCESS) {
@@ -368,7 +363,6 @@ fn findGpuAgent(agent: c.hsa_agent_t, data: ?*anyopaque) callconv(.C) c.hsa_stat
     return c.HSA_STATUS_SUCCESS;
 }
 
-// Kernel execution function
 fn executeKernel(
     ctx: *GpuContext,
     symbol: c.hsa_executable_symbol_t,
@@ -382,11 +376,9 @@ fn executeKernel(
         return HsaError.ExecutionFailed;
     }
 
-    // Create dispatch packet
     const queue = ctx.queue.?;
     const packet_id = c.hsa_queue_add_write_index_relaxed(queue, 1);
 
-    // Cast base_address to the correct packet type and then index
     const base_packets = @as([*]c.hsa_kernel_dispatch_packet_t, @ptrCast(@alignCast(queue.base_address)));
     const packet_ptr = &base_packets[@mod(packet_id, queue.size)];
 
@@ -394,7 +386,7 @@ fn executeKernel(
         @as(u16, c.HSA_FENCE_SCOPE_SYSTEM) << c.HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE |
         @as(u16, c.HSA_FENCE_SCOPE_SYSTEM) << c.HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE;
 
-    packet_ptr.setup = 1; // Dimensions
+    packet_ptr.setup = 1;
     packet_ptr.workgroup_size_x = @intCast(workgroup_size[0]);
     packet_ptr.workgroup_size_y = @intCast(workgroup_size[1]);
     packet_ptr.workgroup_size_z = @intCast(workgroup_size[2]);
@@ -404,17 +396,14 @@ fn executeKernel(
     packet_ptr.kernel_object = kernel_object;
     packet_ptr.kernarg_address = @ptrCast(@constCast(kernargs.ptr));
     packet_ptr.private_segment_size = 0;
-    packet_ptr.group_segment_size = 2048; // Shared memory size
+    packet_ptr.group_segment_size = 2048;
 
-    // Ring doorbell
     c.hsa_queue_store_write_index_relaxed(queue, packet_id + 1);
     c.hsa_signal_store_relaxed(queue.doorbell_signal, @intCast(packet_id));
 
-    // Wait for completion
     while (c.hsa_signal_wait_scacquire(queue.doorbell_signal, c.HSA_SIGNAL_CONDITION_LT, @intCast(packet_id + 1), std.math.maxInt(u64), c.HSA_WAIT_STATE_BLOCKED) != 0) {}
 }
 
-// Main application
 pub fn main() !void {
     print("Initializing AMD GPU compute with HSA runtime...\n", .{});
 
@@ -426,7 +415,6 @@ pub fn main() !void {
 
     print("GPU context initialized successfully\n", .{});
 
-    // Load kernels
     var kernel_manager = KernelManager.init(&ctx, "kernel.o") catch |err| {
         print("Failed to load kernels: {}\n", .{err});
         return;
@@ -435,10 +423,7 @@ pub fn main() !void {
 
     print("Kernels loaded successfully\n", .{});
 
-    // Test vector addition with shared memory
     try testVectorAddition(&ctx, &kernel_manager);
-
-    // Test matrix multiplication with shared memory
     try testMatrixMultiplication(&ctx, &kernel_manager);
 
     print("All tests completed successfully!\n", .{});
@@ -451,7 +436,6 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
     const workgroup_size: u32 = 256;
     const num_groups = (n + workgroup_size - 1) / workgroup_size;
 
-    // Allocate device memory
     const a = try ctx.allocateMemory(n * @sizeOf(f32), f32);
     const b = try ctx.allocateMemory(n * @sizeOf(f32), f32);
     const result_c = try ctx.allocateMemory(num_groups * @sizeOf(f32), f32);
@@ -459,14 +443,12 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
     defer ctx.freeMemory(b);
     defer ctx.freeMemory(result_c);
 
-    // Initialize input data
     for (0..n) |i| {
         a[i] = @floatFromInt(i);
         b[i] = @floatFromInt(i * 2);
     }
 
-    // Prepare kernel arguments
-    const kernargs = try ctx.allocateKernargs(4 * 8); // 4 pointers
+    const kernargs = try ctx.allocateKernargs(4 * 8);
     defer ctx.freeMemory(kernargs);
 
     const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs);
@@ -475,11 +457,9 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
     arg_ptrs[2] = @intFromPtr(result_c.ptr);
     arg_ptrs[3] = n;
 
-    // Get kernel symbol and execute
     const symbol = try kernel_manager.getKernelSymbol("vector_add_shared");
     try executeKernel(ctx, symbol, kernargs, .{ num_groups * workgroup_size, 1, 1 }, .{ workgroup_size, 1, 1 });
 
-    // Verify results
     print("First few results: ", .{});
     for (0..@min(8, num_groups)) |i| {
         print("{:.1} ", .{result_c[i]});
@@ -493,7 +473,6 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
     const width: u32 = 128;
     const tile_size: u32 = 16;
 
-    // Allocate device memory
     const a = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
     const b = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
     const result_c = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
@@ -501,7 +480,6 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
     defer ctx.freeMemory(b);
     defer ctx.freeMemory(result_c);
 
-    // Initialize matrices
     for (0..width) |i| {
         for (0..width) |j| {
             a[i * width + j] = @floatFromInt(i + j);
@@ -510,7 +488,6 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
         }
     }
 
-    // Prepare kernel arguments
     const kernargs = try ctx.allocateKernargs(4 * 8);
     defer ctx.freeMemory(kernargs);
 
@@ -520,13 +497,11 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
     arg_ptrs[2] = @intFromPtr(result_c.ptr);
     arg_ptrs[3] = width;
 
-    // Execute kernel
     const symbol = try kernel_manager.getKernelSymbol("matrix_multiply_shared");
     const grid_dim = (width + tile_size - 1) / tile_size;
 
     try executeKernel(ctx, symbol, kernargs, .{ grid_dim * tile_size, grid_dim * tile_size, 1 }, .{ tile_size, tile_size, 1 });
 
-    // Verify a few results
     print("Sample results from C matrix:\n", .{});
     for (0..4) |i| {
         for (0..4) |j| {
