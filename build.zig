@@ -20,21 +20,25 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Kernel compilation to amdgcn
-    const kernel_step = b.addSystemCommand(&.{
-        "zig",     "build-obj",
-        "-target", "amdgcn-amdhsa-none",
-        "-mcpu=gfx1031", // Adjust for your GPU
-        "--name",
-        "kernel",
-        "-O",
-        "ReleaseFast",
-        "-fno-strip",
+    // Step 1: Generate LLVM IR from Zig kernel
+    const ir_step = b.addSystemCommand(&.{
+        "zig",                      "build-obj",
+        "-target",                  "amdgcn-amdhsa-none",
+        "-mcpu=gfx1031",            "-O",
+        "ReleaseFast",              "-fno-strip",
+        "-femit-llvm-ir=kernel.ll", "-fno-emit-bin",
         "src/kernel.zig",
     });
 
-    b.installArtifact(exe);
-    exe.step.dependOn(&kernel_step.step);
+    const hsa_step = b.addSystemCommand(&.{
+        "/usr/lib/llvm19/bin/clang", "-x",                      "ir",
+        "-target",                   "amdgcn-amd-amdhsa",       "-mcpu=gfx1031",
+        "-O3",                       "-mcode-object-version=4", "-o",
+        "kernel.o",                  "kernel.ll",
+    });
+    hsa_step.step.dependOn(&ir_step.step);
+
+    exe.step.dependOn(&hsa_step.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
