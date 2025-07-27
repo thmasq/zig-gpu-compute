@@ -27,9 +27,9 @@ const GpuContext = struct {
 
     const Self = @This();
 
-    fn init(allocator: Allocator) !Self {
+    fn init() !Self { // Removed unused allocator parameter
         // Initialize HSA
-        var status = c.hsa_init();
+        const status = c.hsa_init();
         if (status != c.HSA_STATUS_SUCCESS) {
             return HsaError.HsaInitFailed;
         }
@@ -43,20 +43,20 @@ const GpuContext = struct {
         };
 
         // Find GPU agent
-        status = c.hsa_iterate_agents(findGpuAgent, &ctx.agent);
-        if (status != c.HSA_STATUS_SUCCESS) {
+        const find_status = c.hsa_iterate_agents(findGpuAgent, &ctx.agent);
+        if (find_status != c.HSA_STATUS_SUCCESS) {
             return HsaError.AgentNotFound;
         }
 
         // Find memory regions
-        status = c.hsa_agent_iterate_regions(ctx.agent, findMemoryRegions, &ctx);
-        if (status != c.HSA_STATUS_SUCCESS) {
+        const region_status = c.hsa_agent_iterate_regions(ctx.agent, findMemoryRegions, &ctx);
+        if (region_status != c.HSA_STATUS_SUCCESS) {
             return HsaError.AgentNotFound;
         }
 
         // Create queue
-        status = c.hsa_queue_create(ctx.agent, 1024, c.HSA_QUEUE_TYPE_MULTI, null, null, 0, 0, &ctx.queue);
-        if (status != c.HSA_STATUS_SUCCESS) {
+        const queue_status = c.hsa_queue_create(ctx.agent, 1024, c.HSA_QUEUE_TYPE_MULTI, null, null, 0, 0, &ctx.queue);
+        if (queue_status != c.HSA_STATUS_SUCCESS) {
             return HsaError.QueueCreationFailed;
         }
 
@@ -100,16 +100,15 @@ const GpuContext = struct {
 
 // Kernel management
 const KernelManager = struct {
-    code_object: c.hsa_code_object_t,
+    code_object_reader: c.hsa_code_object_reader_t,
     executable: c.hsa_executable_t,
+    code_data: []u8,
+    allocator: std.mem.Allocator,
 
     const Self = @This();
 
     fn init(ctx: *GpuContext, object_file: []const u8) !Self {
-        var manager = Self{
-            .code_object = undefined,
-            .executable = undefined,
-        };
+        const allocator = std.heap.page_allocator;
 
         // Create code object from file
         var file = std.fs.cwd().openFile(object_file, .{}) catch |err| {
@@ -119,33 +118,45 @@ const KernelManager = struct {
         defer file.close();
 
         const file_size = try file.getEndPos();
-        const allocator = std.heap.page_allocator;
         const code_data = try allocator.alloc(u8, file_size);
-        defer allocator.free(code_data);
+        errdefer allocator.free(code_data);
 
         _ = try file.readAll(code_data);
 
-        var status = c.hsa_code_object_deserialize(code_data.ptr, file_size, null, &manager.code_object);
+        var manager = Self{
+            .code_object_reader = undefined,
+            .executable = undefined,
+            .code_data = code_data,
+            .allocator = allocator,
+        };
+
+        // Create code object reader from memory
+        var status = c.hsa_code_object_reader_create_from_memory(code_data.ptr, file_size, &manager.code_object_reader);
         if (status != c.HSA_STATUS_SUCCESS) {
-            print("Failed to deserialize code object: {}\n", .{status});
+            print("Failed to create code object reader: {}\n", .{status});
             return HsaError.CodeObjectLoadFailed;
         }
 
         // Create executable
         status = c.hsa_executable_create_alt(c.HSA_PROFILE_FULL, c.HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT, null, &manager.executable);
         if (status != c.HSA_STATUS_SUCCESS) {
+            _ = c.hsa_code_object_reader_destroy(manager.code_object_reader);
             return HsaError.CodeObjectLoadFailed;
         }
 
-        // Load code object
-        status = c.hsa_executable_load_agent_code_object(manager.executable, ctx.agent, manager.code_object, null, null);
+        // Load code object reader
+        status = c.hsa_executable_load_agent_code_object(manager.executable, ctx.agent, manager.code_object_reader, null, null);
         if (status != c.HSA_STATUS_SUCCESS) {
+            _ = c.hsa_executable_destroy(manager.executable);
+            _ = c.hsa_code_object_reader_destroy(manager.code_object_reader);
             return HsaError.CodeObjectLoadFailed;
         }
 
         // Freeze executable
         status = c.hsa_executable_freeze(manager.executable, null);
         if (status != c.HSA_STATUS_SUCCESS) {
+            _ = c.hsa_executable_destroy(manager.executable);
+            _ = c.hsa_code_object_reader_destroy(manager.code_object_reader);
             return HsaError.CodeObjectLoadFailed;
         }
 
@@ -157,7 +168,7 @@ const KernelManager = struct {
 
         const status = c.hsa_executable_get_symbol_by_name(self.executable, kernel_name.ptr, null, &symbol);
         if (status != c.HSA_STATUS_SUCCESS) {
-            print("Kernel '{}' not found\n", .{kernel_name});
+            print("Kernel '{s}' not found\n", .{kernel_name});
             return HsaError.KernelNotFound;
         }
 
@@ -166,7 +177,8 @@ const KernelManager = struct {
 
     fn deinit(self: *Self) void {
         _ = c.hsa_executable_destroy(self.executable);
-        _ = c.hsa_code_object_destroy(self.code_object);
+        _ = c.hsa_code_object_reader_destroy(self.code_object_reader);
+        self.allocator.free(self.code_data);
     }
 };
 
@@ -179,7 +191,7 @@ fn executeKernel(
     workgroup_size: [3]u32,
 ) !void {
     var kernel_object: u64 = undefined;
-    var status = c.hsa_executable_symbol_get_info(symbol, c.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &kernel_object);
+    const status = c.hsa_executable_symbol_get_info(symbol, c.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &kernel_object); // Changed from var to const
     if (status != c.HSA_STATUS_SUCCESS) {
         return HsaError.ExecutionFailed;
     }
@@ -187,7 +199,10 @@ fn executeKernel(
     // Create dispatch packet
     const queue = ctx.queue.?;
     const packet_id = c.hsa_queue_add_write_index_relaxed(queue, 1);
-    const packet_ptr = @as(*c.hsa_kernel_dispatch_packet_t, @ptrCast(&queue.base_address[@mod(packet_id, queue.size) * @sizeOf(c.hsa_kernel_dispatch_packet_t)]));
+
+    // Cast base_address to the correct packet type and then index
+    const base_packets = @as([*]c.hsa_kernel_dispatch_packet_t, @ptrCast(@alignCast(queue.base_address)));
+    const packet_ptr = &base_packets[@mod(packet_id, queue.size)];
 
     packet_ptr.header = @as(u16, c.HSA_PACKET_TYPE_KERNEL_DISPATCH) << c.HSA_PACKET_HEADER_TYPE |
         @as(u16, c.HSA_FENCE_SCOPE_SYSTEM) << c.HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE |
@@ -201,22 +216,22 @@ fn executeKernel(
     packet_ptr.grid_size_y = @intCast(grid_size[1]);
     packet_ptr.grid_size_z = @intCast(grid_size[2]);
     packet_ptr.kernel_object = kernel_object;
-    packet_ptr.kernarg_address = @intFromPtr(kernargs.ptr);
+    packet_ptr.kernarg_address = @ptrCast(@constCast(kernargs.ptr));
     packet_ptr.private_segment_size = 0;
     packet_ptr.group_segment_size = 2048; // Shared memory size
 
     // Ring doorbell
     c.hsa_queue_store_write_index_relaxed(queue, packet_id + 1);
-    c.hsa_signal_store_relaxed(queue.doorbell_signal, packet_id);
+    c.hsa_signal_store_relaxed(queue.doorbell_signal, @intCast(packet_id));
 
     // Wait for completion
-    while (c.hsa_signal_wait_scacquire(queue.doorbell_signal, c.HSA_SIGNAL_CONDITION_LT, packet_id + 1, std.math.maxInt(u64), c.HSA_WAIT_STATE_BLOCKED) != 0) {}
+    while (c.hsa_signal_wait_scacquire(queue.doorbell_signal, c.HSA_SIGNAL_CONDITION_LT, @intCast(packet_id + 1), std.math.maxInt(u64), c.HSA_WAIT_STATE_BLOCKED) != 0) {}
 }
 
 // Helper functions for HSA
 fn findGpuAgent(agent: c.hsa_agent_t, data: ?*anyopaque) callconv(.C) c.hsa_status_t {
     var device_type: c.hsa_device_type_t = undefined;
-    var status = c.hsa_agent_get_info(agent, c.HSA_AGENT_INFO_DEVICE, &device_type);
+    const status = c.hsa_agent_get_info(agent, c.HSA_AGENT_INFO_DEVICE, &device_type); // Changed from var to const
     if (status != c.HSA_STATUS_SUCCESS) {
         return status;
     }
@@ -234,7 +249,7 @@ fn findMemoryRegions(region: c.hsa_region_t, data: ?*anyopaque) callconv(.C) c.h
     const ctx: *GpuContext = @ptrCast(@alignCast(data));
 
     var segment: c.hsa_region_segment_t = undefined;
-    var status = c.hsa_region_get_info(region, c.HSA_REGION_INFO_SEGMENT, &segment);
+    const status = c.hsa_region_get_info(region, c.HSA_REGION_INFO_SEGMENT, &segment);
     if (status != c.HSA_STATUS_SUCCESS) {
         return status;
     }
@@ -243,9 +258,9 @@ fn findMemoryRegions(region: c.hsa_region_t, data: ?*anyopaque) callconv(.C) c.h
         ctx.kernarg_region = region;
     } else if (segment == c.HSA_REGION_SEGMENT_GLOBAL) {
         var flags: c.hsa_region_global_flag_t = undefined;
-        status = c.hsa_region_get_info(region, c.HSA_REGION_INFO_GLOBAL_FLAGS, &flags);
-        if (status != c.HSA_STATUS_SUCCESS) {
-            return status;
+        const flag_status = c.hsa_region_get_info(region, c.HSA_REGION_INFO_GLOBAL_FLAGS, &flags);
+        if (flag_status != c.HSA_STATUS_SUCCESS) {
+            return flag_status;
         }
 
         if ((flags & c.HSA_REGION_GLOBAL_FLAG_FINE_GRAINED) != 0) {
@@ -260,15 +275,15 @@ fn findMemoryRegions(region: c.hsa_region_t, data: ?*anyopaque) callconv(.C) c.h
 
 // Main application
 pub fn main() !void {
-    print("Initializing AMD GPU compute with HSA runtime...\n");
+    print("Initializing AMD GPU compute with HSA runtime...\n", .{}); // Added empty args tuple
 
-    var ctx = GpuContext.init(std.heap.page_allocator) catch |err| {
+    var ctx = GpuContext.init() catch |err| { // Removed allocator parameter
         print("Failed to initialize GPU context: {}\n", .{err});
         return;
     };
     defer ctx.deinit();
 
-    print("GPU context initialized successfully\n");
+    print("GPU context initialized successfully\n", .{}); // Added empty args tuple
 
     // Load kernels
     var kernel_manager = KernelManager.init(&ctx, "kernel.o") catch |err| {
@@ -277,7 +292,7 @@ pub fn main() !void {
     };
     defer kernel_manager.deinit();
 
-    print("Kernels loaded successfully\n");
+    print("Kernels loaded successfully\n", .{}); // Added empty args tuple
 
     // Test vector addition with shared memory
     try testVectorAddition(&ctx, &kernel_manager);
@@ -285,11 +300,11 @@ pub fn main() !void {
     // Test matrix multiplication with shared memory
     try testMatrixMultiplication(&ctx, &kernel_manager);
 
-    print("All tests completed successfully!\n");
+    print("All tests completed successfully!\n", .{}); // Added empty args tuple
 }
 
 fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
-    print("\n=== Testing Vector Addition with Shared Memory ===\n");
+    print("\n=== Testing Vector Addition with Shared Memory ===\n", .{}); // Added empty args tuple
 
     const n: u32 = 1024;
     const workgroup_size: u32 = 256;
@@ -298,10 +313,10 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
     // Allocate device memory
     const a = try ctx.allocateMemory(n * @sizeOf(f32), f32);
     const b = try ctx.allocateMemory(n * @sizeOf(f32), f32);
-    const c = try ctx.allocateMemory(num_groups * @sizeOf(f32), f32);
+    const result_c = try ctx.allocateMemory(num_groups * @sizeOf(f32), f32); // Renamed from 'c' to 'result_c'
     defer ctx.freeMemory(a);
     defer ctx.freeMemory(b);
-    defer ctx.freeMemory(c);
+    defer ctx.freeMemory(result_c); // Updated variable name
 
     // Initialize input data
     for (0..n) |i| {
@@ -316,7 +331,7 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
     const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs);
     arg_ptrs[0] = @intFromPtr(a.ptr);
     arg_ptrs[1] = @intFromPtr(b.ptr);
-    arg_ptrs[2] = @intFromPtr(c.ptr);
+    arg_ptrs[2] = @intFromPtr(result_c.ptr); // Updated variable name
     arg_ptrs[3] = n;
 
     // Get kernel symbol and execute
@@ -324,15 +339,15 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
     try executeKernel(ctx, symbol, kernargs, .{ num_groups * workgroup_size, 1, 1 }, .{ workgroup_size, 1, 1 });
 
     // Verify results
-    print("First few results: ");
+    print("First few results: ", .{}); // Added empty args tuple
     for (0..@min(8, num_groups)) |i| {
-        print("{:.1} ", .{c[i]});
+        print("{:.1} ", .{result_c[i]}); // Updated variable name
     }
-    print("\n");
+    print("\n", .{}); // Added empty args tuple
 }
 
 fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
-    print("\n=== Testing Matrix Multiplication with Shared Memory ===\n");
+    print("\n=== Testing Matrix Multiplication with Shared Memory ===\n", .{}); // Added empty args tuple
 
     const width: u32 = 128;
     const tile_size: u32 = 16;
@@ -340,17 +355,17 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
     // Allocate device memory
     const a = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
     const b = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
-    const c = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
+    const result_c = try ctx.allocateMemory(width * width * @sizeOf(f32), f32); // Renamed from 'c' to 'result_c'
     defer ctx.freeMemory(a);
     defer ctx.freeMemory(b);
-    defer ctx.freeMemory(c);
+    defer ctx.freeMemory(result_c); // Updated variable name
 
     // Initialize matrices
     for (0..width) |i| {
         for (0..width) |j| {
             a[i * width + j] = @floatFromInt(i + j);
             b[i * width + j] = @floatFromInt(i * j + 1);
-            c[i * width + j] = 0.0;
+            result_c[i * width + j] = 0.0; // Updated variable name
         }
     }
 
@@ -361,7 +376,7 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
     const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs);
     arg_ptrs[0] = @intFromPtr(a.ptr);
     arg_ptrs[1] = @intFromPtr(b.ptr);
-    arg_ptrs[2] = @intFromPtr(c.ptr);
+    arg_ptrs[2] = @intFromPtr(result_c.ptr); // Updated variable name
     arg_ptrs[3] = width;
 
     // Execute kernel
@@ -371,11 +386,11 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
     try executeKernel(ctx, symbol, kernargs, .{ grid_dim * tile_size, grid_dim * tile_size, 1 }, .{ tile_size, tile_size, 1 });
 
     // Verify a few results
-    print("Sample results from C matrix:\n");
+    print("Sample results from C matrix:\n", .{}); // Added empty args tuple
     for (0..4) |i| {
         for (0..4) |j| {
-            print("{:.1} ", .{c[i * width + j]});
+            print("{:.1} ", .{result_c[i * width + j]}); // Updated variable name
         }
-        print("\n");
+        print("\n", .{}); // Added empty args tuple
     }
 }
