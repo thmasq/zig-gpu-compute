@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     const kernel_step = b.addSystemCommand(&.{
         "zig",     "build-obj",
         "-target", "amdgcn-amdhsa-none",
-        "-mcpu=gfx1031", // Adjust for your GPU
+        "-mcpu=gfx1030", // Adjust for your GPU
         "--name",
         "kernel",
         "-O",

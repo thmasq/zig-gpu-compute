@@ -27,12 +27,15 @@ const GpuContext = struct {
 
     const Self = @This();
 
-    fn init() !Self { // Removed unused allocator parameter
+    fn init() !Self {
         // Initialize HSA
         const status = c.hsa_init();
         if (status != c.HSA_STATUS_SUCCESS) {
+            print("HSA init failed with status: {}\n", .{status});
             return HsaError.HsaInitFailed;
         }
+
+        print("HSA initialized successfully\n", .{});
 
         var ctx = Self{
             .agent = undefined,
@@ -42,9 +45,14 @@ const GpuContext = struct {
             .coarse_grained_region = undefined,
         };
 
+        print("Searching for GPU agents...\n", .{});
+
         // Find GPU agent
         const find_status = c.hsa_iterate_agents(findGpuAgent, &ctx.agent);
-        if (find_status != c.HSA_STATUS_SUCCESS) {
+        print("Agent iteration returned: {}\n", .{find_status});
+
+        if (find_status != c.HSA_STATUS_SUCCESS and find_status != c.HSA_STATUS_INFO_BREAK) {
+            print("No GPU agent found. Status: {}\n", .{find_status});
             return HsaError.AgentNotFound;
         }
 
@@ -110,18 +118,28 @@ const KernelManager = struct {
     fn init(ctx: *GpuContext, object_file: []const u8) !Self {
         const allocator = std.heap.page_allocator;
 
+        print("Attempting to load kernel object file: {s}\n", .{object_file});
+
         // Create code object from file
         var file = std.fs.cwd().openFile(object_file, .{}) catch |err| {
-            print("Failed to open kernel object file: {}\n", .{err});
+            print("Failed to open kernel object file '{s}': {}\n", .{ object_file, err });
             return HsaError.CodeObjectLoadFailed;
         };
         defer file.close();
 
         const file_size = try file.getEndPos();
+        print("Kernel object file size: {} bytes\n", .{file_size});
+
         const code_data = try allocator.alloc(u8, file_size);
         errdefer allocator.free(code_data);
 
         _ = try file.readAll(code_data);
+        print("Successfully read {} bytes from kernel file\n", .{code_data.len});
+
+        // Check file header to see if it looks like a valid object file
+        if (code_data.len >= 4) {
+            print("File header: 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} 0x{X:0>2}\n", .{ code_data[0], code_data[1], code_data[2], code_data[3] });
+        }
 
         var manager = Self{
             .code_object_reader = undefined,
@@ -131,34 +149,45 @@ const KernelManager = struct {
         };
 
         // Create code object reader from memory
+        print("Creating code object reader from memory...\n", .{});
         var status = c.hsa_code_object_reader_create_from_memory(code_data.ptr, file_size, &manager.code_object_reader);
         if (status != c.HSA_STATUS_SUCCESS) {
-            print("Failed to create code object reader: {}\n", .{status});
+            print("Failed to create code object reader: {} (0x{X})\n", .{ status, status });
             return HsaError.CodeObjectLoadFailed;
         }
+        print("Code object reader created successfully\n", .{});
 
         // Create executable
+        print("Creating HSA executable...\n", .{});
         status = c.hsa_executable_create_alt(c.HSA_PROFILE_FULL, c.HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT, null, &manager.executable);
         if (status != c.HSA_STATUS_SUCCESS) {
+            print("Failed to create executable: {} (0x{X})\n", .{ status, status });
             _ = c.hsa_code_object_reader_destroy(manager.code_object_reader);
             return HsaError.CodeObjectLoadFailed;
         }
+        print("HSA executable created successfully\n", .{});
 
         // Load code object reader
+        print("Loading agent code object...\n", .{});
         status = c.hsa_executable_load_agent_code_object(manager.executable, ctx.agent, manager.code_object_reader, null, null);
         if (status != c.HSA_STATUS_SUCCESS) {
+            print("Failed to load agent code object: {} (0x{X})\n", .{ status, status });
             _ = c.hsa_executable_destroy(manager.executable);
             _ = c.hsa_code_object_reader_destroy(manager.code_object_reader);
             return HsaError.CodeObjectLoadFailed;
         }
+        print("Agent code object loaded successfully\n", .{});
 
         // Freeze executable
+        print("Freezing executable...\n", .{});
         status = c.hsa_executable_freeze(manager.executable, null);
         if (status != c.HSA_STATUS_SUCCESS) {
+            print("Failed to freeze executable: {} (0x{X})\n", .{ status, status });
             _ = c.hsa_executable_destroy(manager.executable);
             _ = c.hsa_code_object_reader_destroy(manager.code_object_reader);
             return HsaError.CodeObjectLoadFailed;
         }
+        print("Executable frozen successfully\n", .{});
 
         return manager;
     }
@@ -166,11 +195,13 @@ const KernelManager = struct {
     fn getKernelSymbol(self: *Self, kernel_name: []const u8) !c.hsa_executable_symbol_t {
         var symbol: c.hsa_executable_symbol_t = undefined;
 
+        print("Looking for kernel symbol: {s}\n", .{kernel_name});
         const status = c.hsa_executable_get_symbol_by_name(self.executable, kernel_name.ptr, null, &symbol);
         if (status != c.HSA_STATUS_SUCCESS) {
-            print("Kernel '{s}' not found\n", .{kernel_name});
+            print("Kernel '{s}' not found, status: {} (0x{X})\n", .{ kernel_name, status, status });
             return HsaError.KernelNotFound;
         }
+        print("Found kernel symbol: {s}\n", .{kernel_name});
 
         return symbol;
     }
@@ -231,12 +262,21 @@ fn executeKernel(
 // Helper functions for HSA
 fn findGpuAgent(agent: c.hsa_agent_t, data: ?*anyopaque) callconv(.C) c.hsa_status_t {
     var device_type: c.hsa_device_type_t = undefined;
-    const status = c.hsa_agent_get_info(agent, c.HSA_AGENT_INFO_DEVICE, &device_type); // Changed from var to const
+    const status = c.hsa_agent_get_info(agent, c.HSA_AGENT_INFO_DEVICE, &device_type);
     if (status != c.HSA_STATUS_SUCCESS) {
+        print("Failed to get agent info: {}\n", .{status});
         return status;
     }
 
+    // Debug: Print all agents found
+    var name: [64]u8 = undefined;
+    const name_status = c.hsa_agent_get_info(agent, c.HSA_AGENT_INFO_NAME, &name);
+    if (name_status == c.HSA_STATUS_SUCCESS) {
+        print("Found agent: {s}, type: {}\n", .{ name, device_type });
+    }
+
     if (device_type == c.HSA_DEVICE_TYPE_GPU) {
+        print("Found GPU agent!\n", .{});
         const agent_ptr: *c.hsa_agent_t = @ptrCast(@alignCast(data));
         agent_ptr.* = agent;
         return c.HSA_STATUS_INFO_BREAK;
