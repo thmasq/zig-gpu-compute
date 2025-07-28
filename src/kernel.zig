@@ -11,6 +11,20 @@ extern fn @"llvm.amdgcn.s.barrier"() void;
 // Shared memory declaration using addrspace
 var shared_mem: [512]f32 addrspace(.shared) = undefined;
 
+// Helper functions for safe shared memory access
+inline fn setSharedMem(index: u32, value: f32) void {
+    if (index < 512) {
+        shared_mem[index] = value;
+    }
+}
+
+inline fn getSharedMem(index: u32) f32 {
+    if (index < 512) {
+        return shared_mem[index];
+    }
+    return 0.0;
+}
+
 // Kernel attributes for AMD GPU
 export fn vector_add_shared(a: [*]addrspace(.global) const f32, b: [*]addrspace(.global) const f32, c: [*]addrspace(.global) f32, n: u32) callconv(.Kernel) void {
     // Correct ID usage
@@ -44,54 +58,61 @@ export fn vector_add_shared(a: [*]addrspace(.global) const f32, b: [*]addrspace(
 }
 
 export fn matrix_multiply_shared(a: [*]addrspace(.global) const f32, b: [*]addrspace(.global) const f32, c: [*]addrspace(.global) f32, width: u32) callconv(.Kernel) void {
-    // Correct ID usage
-    const local_x = @"llvm.amdgcn.workitem.id.x"(); // Local thread ID in X
-    const local_y = @"llvm.amdgcn.workitem.id.y"(); // Local thread ID in Y
-    const group_x = @"llvm.amdgcn.workgroup.id.x"(); // Workgroup ID in X
-    const group_y = @"llvm.amdgcn.workgroup.id.y"(); // Workgroup ID in Y
+    const local_x = @"llvm.amdgcn.workitem.id.x"();
+    const local_y = @"llvm.amdgcn.workitem.id.y"();
+    const group_x = @"llvm.amdgcn.workgroup.id.x"();
+    const group_y = @"llvm.amdgcn.workgroup.id.y"();
 
     const TILE_SIZE = 16;
 
-    // Use global shared memory instead of local variables
-    const as_tile = @as(*[TILE_SIZE][TILE_SIZE]f32, @ptrFromInt(@intFromPtr(&shared_mem[0])));
-    const bs_tile = @as(*[TILE_SIZE][TILE_SIZE]f32, @ptrFromInt(@intFromPtr(&shared_mem[256])));
-
+    // Bounds check early
     const row = group_y * TILE_SIZE + local_y;
     const col = group_x * TILE_SIZE + local_x;
+
+    if (row >= width or col >= width) return;
+
+    const a_tile_base: u32 = 0;
+    const b_tile_base: u32 = 256;
 
     var c_val: f32 = 0.0;
 
     // Tile across the K dimension
     var tile: u32 = 0;
     while (tile < (width + TILE_SIZE - 1) / TILE_SIZE) : (tile += 1) {
-        // Load tiles into shared memory
+        // Load tiles into shared memory with bounds checking
         const a_col = tile * TILE_SIZE + local_x;
         const b_row = tile * TILE_SIZE + local_y;
 
+        // Load A tile element
+        const a_tile_idx = a_tile_base + local_y * TILE_SIZE + local_x;
         if (row < width and a_col < width) {
-            as_tile[local_y][local_x] = a[row * width + a_col];
+            setSharedMem(a_tile_idx, a[row * width + a_col]);
         } else {
-            as_tile[local_y][local_x] = 0.0;
+            setSharedMem(a_tile_idx, 0.0);
         }
 
+        // Load B tile element
+        const b_tile_idx = b_tile_base + local_y * TILE_SIZE + local_x;
         if (b_row < width and col < width) {
-            bs_tile[local_y][local_x] = b[b_row * width + col];
+            setSharedMem(b_tile_idx, b[b_row * width + col]);
         } else {
-            bs_tile[local_y][local_x] = 0.0;
+            setSharedMem(b_tile_idx, 0.0);
         }
 
         @"llvm.amdgcn.s.barrier"();
 
-        // Compute partial result
+        // Compute partial result using linear indexing
         var k: u32 = 0;
         while (k < TILE_SIZE) : (k += 1) {
-            c_val += as_tile[local_y][k] * bs_tile[k][local_x];
+            const a_val = getSharedMem(a_tile_base + local_y * TILE_SIZE + k);
+            const b_val = getSharedMem(b_tile_base + k * TILE_SIZE + local_x);
+            c_val += a_val * b_val;
         }
 
         @"llvm.amdgcn.s.barrier"();
     }
 
-    // Write result
+    // Write result with bounds check
     if (row < width and col < width) {
         c[row * width + col] = c_val;
     }
