@@ -365,7 +365,16 @@ fn executeKernel(
         return HsaError.ExecutionFailed;
     }
 
-    print("Executing kernel with grid [{}, {}, {}] workgroup [{}, {}, {}]\n", .{ grid_size[0], grid_size[1], grid_size[2], workgroup_size[0], workgroup_size[1], workgroup_size[2] });
+    // Determine number of dimensions
+    var num_dims: u32 = 1;
+    if (grid_size[2] > 1 or workgroup_size[2] > 1) {
+        num_dims = 3;
+    } else if (grid_size[1] > 1 or workgroup_size[1] > 1) {
+        num_dims = 2;
+    }
+
+    print("Executing kernel with {} dimensions\n", .{num_dims});
+    print("Grid [{}, {}, {}] workgroup [{}, {}, {}]\n", .{ grid_size[0], grid_size[1], grid_size[2], workgroup_size[0], workgroup_size[1], workgroup_size[2] });
 
     const queue = ctx.queue.?;
 
@@ -385,11 +394,12 @@ fn executeKernel(
     // Clear the packet first
     @memset(@as([*]u8, @ptrCast(packet_ptr))[0..@sizeOf(c.hsa_kernel_dispatch_packet_t)], 0);
 
+    packet_ptr.setup = @as(u16, @intCast(num_dims)) << c.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
+
     packet_ptr.header = @as(u16, c.HSA_PACKET_TYPE_KERNEL_DISPATCH) << c.HSA_PACKET_HEADER_TYPE |
         @as(u16, c.HSA_FENCE_SCOPE_SYSTEM) << c.HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE |
         @as(u16, c.HSA_FENCE_SCOPE_SYSTEM) << c.HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE;
 
-    packet_ptr.setup = 1;
     packet_ptr.workgroup_size_x = @intCast(workgroup_size[0]);
     packet_ptr.workgroup_size_y = @intCast(workgroup_size[1]);
     packet_ptr.workgroup_size_z = @intCast(workgroup_size[2]);
@@ -402,7 +412,7 @@ fn executeKernel(
     packet_ptr.group_segment_size = 2048; // Shared memory size
     packet_ptr.completion_signal = completion_signal;
 
-    print("Dispatching kernel...\n", .{});
+    print("Packet setup: dimensions={}, setup=0x{X}\n", .{ num_dims, packet_ptr.setup });
 
     // Submit the packet
     c.hsa_queue_store_write_index_relaxed(queue, packet_id + 1);
@@ -418,6 +428,53 @@ fn executeKernel(
     }
 
     print("Kernel completed successfully\n", .{});
+}
+
+fn matrixMultiplyCPU(a: []const f32, b: []const f32, result: []f32, width: u32) void {
+    // Initialize result matrix to zero
+    for (result) |*element| {
+        element.* = 0.0;
+    }
+
+    // Standard matrix multiplication: C[i][j] = sum(A[i][k] * B[k][j])
+    for (0..width) |i| {
+        for (0..width) |j| {
+            var sum: f32 = 0.0;
+            for (0..width) |k| {
+                sum += a[i * width + k] * b[k * width + j];
+            }
+            result[i * width + j] = sum;
+        }
+    }
+}
+
+// Function to compare two matrices with tolerance
+fn compareMatrices(gpu_result: []const f32, cpu_result: []const f32, width: u32, tolerance: f32) bool {
+    var max_diff: f32 = 0.0;
+    var num_errors: u32 = 0;
+
+    for (0..width) |i| {
+        for (0..width) |j| {
+            const idx = i * width + j;
+            const diff = @abs(gpu_result[idx] - cpu_result[idx]);
+            max_diff = @max(max_diff, diff);
+
+            if (diff > tolerance) {
+                if (num_errors < 10) { // Only print first 10 errors
+                    print("Mismatch at [{}, {}]: GPU={:.6}, CPU={:.6}, diff={:.6}\n", .{ i, j, gpu_result[idx], cpu_result[idx], diff });
+                }
+                num_errors += 1;
+            }
+        }
+    }
+
+    print("Maximum difference: {:.8}\n", .{max_diff});
+    if (num_errors > 0) {
+        print("Total errors with tolerance {:.6}: {}\n", .{ tolerance, num_errors });
+        return false;
+    }
+
+    return true;
 }
 
 pub fn main() !void {
@@ -491,42 +548,109 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
     const width: u32 = 128;
     const tile_size: u32 = 16;
 
+    // Allocate GPU memory
     const a = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
     const b = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
-    const result_c = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
+    const gpu_result = try ctx.allocateMemory(width * width * @sizeOf(f32), f32);
     defer ctx.freeMemory(a);
     defer ctx.freeMemory(b);
-    defer ctx.freeMemory(result_c);
+    defer ctx.freeMemory(gpu_result);
 
+    // Allocate CPU memory for comparison
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const cpu_result = try allocator.alloc(f32, width * width);
+    defer allocator.free(cpu_result);
+
+    // Initialize input matrices
+    print("Initializing matrices...\n", .{});
     for (0..width) |i| {
         for (0..width) |j| {
             a[i * width + j] = @floatFromInt(i + j);
             b[i * width + j] = @floatFromInt(i * j + 1);
-            result_c[i * width + j] = 0.0;
+            gpu_result[i * width + j] = 0.0;
         }
     }
 
+    // Setup kernel arguments
     const kernargs = try ctx.allocateKernargs(28);
     defer ctx.freeMemory(kernargs);
 
     const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs[0..24]);
     arg_ptrs[0] = @intFromPtr(a.ptr);
     arg_ptrs[1] = @intFromPtr(b.ptr);
-    arg_ptrs[2] = @intFromPtr(result_c.ptr);
+    arg_ptrs[2] = @intFromPtr(gpu_result.ptr);
 
     const width_ptr = @as(*u32, @ptrCast(@alignCast(&kernargs[24])));
     width_ptr.* = width;
+
+    // Execute GPU kernel
+    print("Executing GPU matrix multiplication...\n", .{});
+    const start_gpu = std.time.nanoTimestamp();
 
     const symbol = try kernel_manager.getKernelSymbol("matrix_multiply_shared");
     const grid_dim = (width + tile_size - 1) / tile_size;
 
     try executeKernel(ctx, symbol, kernargs, .{ grid_dim * tile_size, grid_dim * tile_size, 1 }, .{ tile_size, tile_size, 1 });
 
-    print("Sample results from C matrix:\n", .{});
+    const end_gpu = std.time.nanoTimestamp();
+    const gpu_time_ms = @as(f64, @floatFromInt(end_gpu - start_gpu)) / 1_000_000.0;
+
+    // Execute CPU matrix multiplication
+    print("Executing CPU matrix multiplication...\n", .{});
+    const start_cpu = std.time.nanoTimestamp();
+
+    matrixMultiplyCPU(a, b, cpu_result, width);
+
+    const end_cpu = std.time.nanoTimestamp();
+    const cpu_time_ms = @as(f64, @floatFromInt(end_cpu - start_cpu)) / 1_000_000.0;
+
+    // Performance comparison
+    print("\n=== Performance Results ===\n", .{});
+    print("GPU time: {:.2} ms\n", .{gpu_time_ms});
+    print("CPU time: {:.2} ms\n", .{cpu_time_ms});
+    print("Speedup: {:.2}x\n", .{cpu_time_ms / gpu_time_ms});
+
+    // Display sample results
+    print("\n=== Sample Results ===\n", .{});
+    print("GPU results (top-left 4x4):\n", .{});
     for (0..4) |i| {
         for (0..4) |j| {
-            print("{:.1} ", .{result_c[i * width + j]});
+            print("{:.1} ", .{gpu_result[i * width + j]});
         }
         print("\n", .{});
     }
+
+    print("CPU results (top-left 4x4):\n", .{});
+    for (0..4) |i| {
+        for (0..4) |j| {
+            print("{:.1} ", .{cpu_result[i * width + j]});
+        }
+        print("\n", .{});
+    }
+
+    // Compare results
+    print("\n=== Correctness Verification ===\n", .{});
+    const tolerance: f32 = 1e-5;
+    const results_match = compareMatrices(gpu_result, cpu_result, width, tolerance);
+
+    if (results_match) {
+        print("✅ SUCCESS: GPU and CPU results match within tolerance ({:.6})\n", .{tolerance});
+    } else {
+        print("❌ FAILURE: GPU and CPU results do not match!\n", .{});
+        return error.ResultMismatch;
+    }
+
+    // Additional statistics
+    var sum_gpu: f64 = 0.0;
+    var sum_cpu: f64 = 0.0;
+    for (0..width * width) |i| {
+        sum_gpu += gpu_result[i];
+        sum_cpu += cpu_result[i];
+    }
+
+    print("Matrix sum - GPU: {:.6}, CPU: {:.6}\n", .{ sum_gpu, sum_cpu });
+    print("Matrix multiplication test completed successfully!\n", .{});
 }
