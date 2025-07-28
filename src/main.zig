@@ -112,11 +112,20 @@ const GpuContext = struct {
         print("Allocating {} bytes ({} elements of {s}) using coarse-grained memory\n", .{ size, size / @sizeOf(T), @typeName(T) });
 
         var ptr: ?*anyopaque = null;
-        const status = c.hsa_memory_allocate(self.coarse_grained_region.?, size, &ptr);
+        var status = c.hsa_memory_allocate(self.coarse_grained_region.?, size, &ptr);
         if (status != c.HSA_STATUS_SUCCESS) {
             print("Memory allocation failed with status: {} (0x{X})\n", .{ status, status });
             return HsaError.MemoryAllocationFailed;
         }
+
+        print("Granting GPU agent access to allocated memory...\n", .{});
+        status = c.hsa_amd_agents_allow_access(1, &self.agent, null, ptr);
+        if (status != c.HSA_STATUS_SUCCESS) {
+            print("Failed to grant GPU access to memory: {} (0x{X})\n", .{ status, status });
+            _ = c.hsa_memory_free(ptr);
+            return HsaError.MemoryAllocationFailed;
+        }
+        print("GPU access granted successfully\n", .{});
 
         const typed_ptr: [*]T = @ptrCast(@alignCast(ptr));
         return typed_ptr[0 .. size / @sizeOf(T)];
@@ -350,16 +359,31 @@ fn executeKernel(
     workgroup_size: [3]u32,
 ) !void {
     var kernel_object: u64 = undefined;
-    const status = c.hsa_executable_symbol_get_info(symbol, c.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &kernel_object);
+    var status = c.hsa_executable_symbol_get_info(symbol, c.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &kernel_object);
     if (status != c.HSA_STATUS_SUCCESS) {
+        print("Failed to get kernel object: {} (0x{X})\n", .{ status, status });
         return HsaError.ExecutionFailed;
     }
 
-    const queue = ctx.queue.?;
-    const packet_id = c.hsa_queue_add_write_index_relaxed(queue, 1);
+    print("Executing kernel with grid [{}, {}, {}] workgroup [{}, {}, {}]\n", .{ grid_size[0], grid_size[1], grid_size[2], workgroup_size[0], workgroup_size[1], workgroup_size[2] });
 
+    const queue = ctx.queue.?;
+
+    // Create a completion signal
+    var completion_signal: c.hsa_signal_t = undefined;
+    status = c.hsa_signal_create(1, 0, null, &completion_signal);
+    if (status != c.HSA_STATUS_SUCCESS) {
+        print("Failed to create completion signal: {} (0x{X})\n", .{ status, status });
+        return HsaError.ExecutionFailed;
+    }
+    defer _ = c.hsa_signal_destroy(completion_signal);
+
+    const packet_id = c.hsa_queue_add_write_index_relaxed(queue, 1);
     const base_packets = @as([*]c.hsa_kernel_dispatch_packet_t, @ptrCast(@alignCast(queue.base_address)));
     const packet_ptr = &base_packets[@mod(packet_id, queue.size)];
+
+    // Clear the packet first
+    @memset(@as([*]u8, @ptrCast(packet_ptr))[0..@sizeOf(c.hsa_kernel_dispatch_packet_t)], 0);
 
     packet_ptr.header = @as(u16, c.HSA_PACKET_TYPE_KERNEL_DISPATCH) << c.HSA_PACKET_HEADER_TYPE |
         @as(u16, c.HSA_FENCE_SCOPE_SYSTEM) << c.HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE |
@@ -375,12 +399,25 @@ fn executeKernel(
     packet_ptr.kernel_object = kernel_object;
     packet_ptr.kernarg_address = @ptrCast(@constCast(kernargs.ptr));
     packet_ptr.private_segment_size = 0;
-    packet_ptr.group_segment_size = 2048;
+    packet_ptr.group_segment_size = 2048; // Shared memory size
+    packet_ptr.completion_signal = completion_signal;
 
+    print("Dispatching kernel...\n", .{});
+
+    // Submit the packet
     c.hsa_queue_store_write_index_relaxed(queue, packet_id + 1);
     c.hsa_signal_store_relaxed(queue.doorbell_signal, @intCast(packet_id));
 
-    while (c.hsa_signal_wait_scacquire(queue.doorbell_signal, c.HSA_SIGNAL_CONDITION_LT, @intCast(packet_id + 1), std.math.maxInt(u64), c.HSA_WAIT_STATE_BLOCKED) != 0) {}
+    // Wait for completion using the completion signal
+    print("Waiting for kernel completion...\n", .{});
+    const wait_result = c.hsa_signal_wait_scacquire(completion_signal, c.HSA_SIGNAL_CONDITION_EQ, 0, std.math.maxInt(u64), c.HSA_WAIT_STATE_BLOCKED);
+
+    if (wait_result != 0) {
+        print("Kernel execution may have failed or timed out\n", .{});
+        return HsaError.ExecutionFailed;
+    }
+
+    print("Kernel completed successfully\n", .{});
 }
 
 pub fn main() !void {
@@ -469,14 +506,16 @@ fn testMatrixMultiplication(ctx: *GpuContext, kernel_manager: *KernelManager) !v
         }
     }
 
-    const kernargs = try ctx.allocateKernargs(4 * 8);
+    const kernargs = try ctx.allocateKernargs(28);
     defer ctx.freeMemory(kernargs);
 
-    const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs);
+    const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs[0..24]);
     arg_ptrs[0] = @intFromPtr(a.ptr);
     arg_ptrs[1] = @intFromPtr(b.ptr);
     arg_ptrs[2] = @intFromPtr(result_c.ptr);
-    arg_ptrs[3] = width;
+
+    const width_ptr = @as(*u32, @ptrCast(@alignCast(&kernargs[24])));
+    width_ptr.* = width;
 
     const symbol = try kernel_manager.getKernelSymbol("matrix_multiply_shared");
     const grid_dim = (width + tile_size - 1) / tile_size;
