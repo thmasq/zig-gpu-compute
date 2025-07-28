@@ -2,6 +2,9 @@ const std = @import("std");
 const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 
+// Import the embedded GPU kernel
+const gpu_kernel_binary = @embedFile("gpu-kernel");
+
 // HSA Runtime C bindings
 const c = @cImport({
     @cInclude("hsa/hsa.h");
@@ -144,48 +147,26 @@ const GpuContext = struct {
 const KernelManager = struct {
     code_object_reader: c.hsa_code_object_reader_t,
     executable: c.hsa_executable_t,
-    code_data: []u8,
-    allocator: std.mem.Allocator,
-    agent: c.hsa_agent_t, // Add agent reference
+    agent: c.hsa_agent_t,
 
     const Self = @This();
 
-    fn init(ctx: *GpuContext, object_file: []const u8) !Self {
-        const allocator = std.heap.page_allocator;
+    fn init(ctx: *GpuContext) !Self {
+        print("Loading embedded kernel binary ({} bytes)...\n", .{gpu_kernel_binary.len});
 
-        print("Attempting to load kernel object file: {s}\n", .{object_file});
-
-        // Create code object from file
-        var file = std.fs.cwd().openFile(object_file, .{}) catch |err| {
-            print("Failed to open kernel object file '{s}': {}\n", .{ object_file, err });
-            return HsaError.CodeObjectLoadFailed;
-        };
-        defer file.close();
-
-        const file_size = try file.getEndPos();
-        print("Kernel object file size: {} bytes\n", .{file_size});
-
-        const code_data = try allocator.alloc(u8, file_size);
-        errdefer allocator.free(code_data);
-
-        _ = try file.readAll(code_data);
-        print("Successfully read {} bytes from kernel file\n", .{code_data.len});
-
-        if (code_data.len >= 4) {
-            print("File header: 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} 0x{X:0>2}\n", .{ code_data[0], code_data[1], code_data[2], code_data[3] });
+        if (gpu_kernel_binary.len >= 4) {
+            print("Binary header: 0x{X:0>2} 0x{X:0>2} 0x{X:0>2} 0x{X:0>2}\n", .{ gpu_kernel_binary[0], gpu_kernel_binary[1], gpu_kernel_binary[2], gpu_kernel_binary[3] });
         }
 
         var manager = Self{
             .code_object_reader = undefined,
             .executable = undefined,
-            .code_data = code_data,
-            .allocator = allocator,
-            .agent = ctx.agent, // Store agent reference
+            .agent = ctx.agent,
         };
 
-        // Create code object reader from memory
-        print("Creating code object reader from memory...\n", .{});
-        var status = c.hsa_code_object_reader_create_from_memory(code_data.ptr, file_size, &manager.code_object_reader);
+        // Create code object reader from embedded binary
+        print("Creating code object reader from embedded binary...\n", .{});
+        var status = c.hsa_code_object_reader_create_from_memory(gpu_kernel_binary.ptr, gpu_kernel_binary.len, &manager.code_object_reader);
         if (status != c.HSA_STATUS_SUCCESS) {
             print("Failed to create code object reader: {} (0x{X})\n", .{ status, status });
             return HsaError.CodeObjectLoadFailed;
@@ -239,7 +220,6 @@ const KernelManager = struct {
 
         print("Looking for kernel symbol: {s} (length: {})\n", .{ full_name, full_name.len });
 
-        // FIX: Pass the agent reference instead of null
         var status = c.hsa_executable_get_symbol_by_name(self.executable, full_name.ptr, &self.agent, &symbol);
         if (status != c.HSA_STATUS_SUCCESS) {
             print("Symbol lookup with .kd failed: {} (0x{X})\n", .{ status, status });
@@ -269,7 +249,6 @@ const KernelManager = struct {
     fn deinit(self: *Self) void {
         _ = c.hsa_executable_destroy(self.executable);
         _ = c.hsa_code_object_reader_destroy(self.code_object_reader);
-        self.allocator.free(self.code_data);
     }
 };
 
@@ -415,7 +394,7 @@ pub fn main() !void {
 
     print("GPU context initialized successfully\n", .{});
 
-    var kernel_manager = KernelManager.init(&ctx, "kernel.o") catch |err| {
+    var kernel_manager = KernelManager.init(&ctx) catch |err| {
         print("Failed to load kernels: {}\n", .{err});
         return;
     };
@@ -449,6 +428,8 @@ fn testVectorAddition(ctx: *GpuContext, kernel_manager: *KernelManager) !void {
     }
 
     const kernargs = try ctx.allocateKernargs(32);
+    defer ctx.freeMemory(kernargs);
+
     const arg_ptrs = std.mem.bytesAsSlice(u64, kernargs);
     arg_ptrs[0] = @intFromPtr(a.ptr);
     arg_ptrs[1] = @intFromPtr(b.ptr);
